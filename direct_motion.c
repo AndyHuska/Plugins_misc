@@ -38,7 +38,7 @@
 // 1 kHz control loop.
 #define DM_CTRL_HZ 1000u
 // High-rate step emission ISR cadence for deterministic phase integration.
-#define DM_ISR_HZ 20000u
+#define DM_ISR_HZ 40000u
 #define DM_WATCHDOG_MS 1000u
 
 #define DM_DEFAULT_VEL_MM_S 120.0f
@@ -133,13 +133,17 @@ typedef struct {
     dm_axis_t axis[DM_AXES];
     uint16_t last_sequence;
     uint32_t last_velocity_heartbeat_ms;
-    uint32_t last_ctrl_ms;
+    uint32_t ctrl_time_ms;
+    uint16_t ctrl_subtick;
     bool active;
     bool needs_idle_sync;
     bool isr_rate_forced;
     volatile uint8_t mode_snapshot[DM_AXES];
     volatile uint8_t phase_snapshot[DM_AXES];
     volatile bool active_snapshot;
+    volatile int32_t target_vel_snapshot[DM_AXES];
+    volatile int32_t commanded_vel_snapshot[DM_AXES];
+    volatile int32_t current_vel_snapshot[DM_AXES];
 } dm_state_t;
 
 static dm_rx_t rx = {0};
@@ -397,6 +401,23 @@ static void dm_report_rx_move_abs (const dm_move_abs_t *cmd)
     hal.stream.write(msg);
 }
 
+static void dm_report_velocity (uint8_t axis, int32_t target_steps_s_q16, int32_t commanded_steps_s_q16, int32_t current_steps_s_q16)
+{
+    char msg[120];
+
+    strcpy(msg, "[DM:VEL,");
+    strcat(msg, uitoa((uint32_t)axis));
+    strcat(msg, ",t=");
+    dm_append_i32(msg, target_steps_s_q16);
+    strcat(msg, ",cmd=");
+    dm_append_i32(msg, commanded_steps_s_q16);
+    strcat(msg, ",c=");
+    dm_append_i32(msg, current_steps_s_q16);
+    strcat(msg, "]" ASCII_EOL);
+
+    hal.stream.write(msg);
+}
+
 static bool dm_can_start (void)
 {
     sys_state_t state = state_get();
@@ -512,7 +533,9 @@ static void dm_set_velocity_axis (uint8_t axis, int32_t mm_s_q16)
 
     dm_axis_set_defaults(axis);
 
-    int32_t new_target = clamp_i32(mm_s_q16_to_steps_s_q16(axis, mm_s_q16), -a->vmax_steps_s_q16, a->vmax_steps_s_q16);
+    // For direct jog velocity mode, follow host-requested speed directly.
+    // Positional move limits remain enforced in move planning paths.
+    int32_t new_target = mm_s_q16_to_steps_s_q16(axis, mm_s_q16);
 
     // Host key-repeat may resend the same jog vector frequently.
     // Ignore redundant target updates to avoid unnecessary phase churn and log load.
@@ -684,6 +707,9 @@ static void dm_update_ramps_1khz (void)
 
         dm.mode_snapshot[axis] = (uint8_t)a->mode;
         dm.phase_snapshot[axis] = (uint8_t)a->phase;
+        dm.target_vel_snapshot[axis] = a->target_vel_steps_s_q16;
+        dm.commanded_vel_snapshot[axis] = a->commanded_vel_steps_s_q16;
+        dm.current_vel_snapshot[axis] = a->current_vel_steps_s_q16;
     }
 
     dm.active = any_active;
@@ -695,9 +721,6 @@ static void dm_update_ramps_1khz (void)
 
 static void dm_watchdog_velocity_modes (void)
 {
-    if(!hal.get_elapsed_ticks)
-        return;
-
     bool any_nonzero_velocity_target = false;
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
         if(dm.axis[axis].mode == AxisMode_Velocity && dm.axis[axis].target_vel_steps_s_q16 != 0) {
@@ -710,7 +733,7 @@ static void dm_watchdog_velocity_modes (void)
     if(!any_nonzero_velocity_target)
         return;
 
-    uint32_t now = hal.get_elapsed_ticks();
+    uint32_t now = dm.ctrl_time_ms;
     if((now - dm.last_velocity_heartbeat_ms) <= DM_WATCHDOG_MS)
         return;
 
@@ -827,21 +850,22 @@ static void dm_interrupt_callback (void)
     // Force deterministic callback cadence while direct-motion is active.
     // Set once per active session to avoid unnecessary ISR overhead.
     if(!dm.isr_rate_forced) {
-        hal.stepper.cycles_per_tick(hal.f_step_timer / DM_ISR_HZ);
+        uint32_t cpt = hal.f_step_timer / DM_ISR_HZ;
+        if(cpt == 0)
+            cpt = 1;
+        hal.stepper.cycles_per_tick(cpt);
         dm.isr_rate_forced = true;
     }
 
-    if(hal.get_elapsed_ticks) {
-        uint32_t now = hal.get_elapsed_ticks();
-        while((now - dm.last_ctrl_ms) >= 1u) {
-            dm.last_ctrl_ms++;
-            dm_watchdog_velocity_modes();
-            dm_update_ramps_1khz();
-            if(!dm.active)
-                break;
-        }
-    } else
+    // Run 1kHz control loop from ISR cadence so motion does not depend on SysTick
+    // scheduling under high interrupt load.
+    dm.ctrl_subtick++;
+    if(dm.ctrl_subtick >= (DM_ISR_HZ / DM_CTRL_HZ)) {
+        dm.ctrl_subtick = 0;
+        dm.ctrl_time_ms++;
+        dm_watchdog_velocity_modes();
         dm_update_ramps_1khz();
+    }
 
     if(dm.active)
         dm_generate_steps();
@@ -855,8 +879,7 @@ static void dm_apply_velocity_xyz_legacy (const dm_vel_xyz_t *vec)
     for(uint8_t axis = 0; axis < DM_AXES; axis++)
         dm_set_velocity_axis(axis, vec->mm_s_q16[axis]);
 
-    if(hal.get_elapsed_ticks)
-        dm.last_velocity_heartbeat_ms = hal.get_elapsed_ticks();
+    dm.last_velocity_heartbeat_ms = dm.ctrl_time_ms;
 
     dm_set_state_jog_if_needed();
 }
@@ -871,8 +894,7 @@ static void dm_apply_velocity_masked (const dm_velocity_masked_t *cmd)
             dm_set_velocity_axis(axis, cmd->mm_s_q16[axis]);
     }
 
-    if(hal.get_elapsed_ticks)
-        dm.last_velocity_heartbeat_ms = hal.get_elapsed_ticks();
+    dm.last_velocity_heartbeat_ms = dm.ctrl_time_ms;
 
     dm_set_state_jog_if_needed();
 }
@@ -976,8 +998,7 @@ static void dm_handle_frame (uint8_t type, uint16_t sequence, const uint8_t *pay
             break;
 
         case DM_MSG_HEARTBEAT:
-            if(hal.get_elapsed_ticks)
-                dm.last_velocity_heartbeat_ms = hal.get_elapsed_ticks();
+            dm.last_velocity_heartbeat_ms = dm.ctrl_time_ms;
             break;
 
         default:
@@ -1098,6 +1119,7 @@ static void on_execute_realtime (sys_state_t state)
     static uint8_t mode_last[DM_AXES] = {0xFFu, 0xFFu, 0xFFu};
     static uint8_t phase_last[DM_AXES] = {0xFFu, 0xFFu, 0xFFu};
     static bool active_last = false;
+    static uint32_t vel_last_report_ms = 0;
 
     if(on_execute_realtime_org)
         on_execute_realtime_org(state);
@@ -1115,6 +1137,19 @@ static void on_execute_realtime (sys_state_t state)
             dm_report_axis_phase(axis, mode, phase);
             mode_last[axis] = mode;
             phase_last[axis] = phase;
+        }
+    }
+
+    if((uint32_t)(dm.ctrl_time_ms - vel_last_report_ms) >= 100u) {
+        vel_last_report_ms = dm.ctrl_time_ms;
+
+        for(uint8_t axis = 0; axis < DM_AXES; axis++) {
+            int32_t t = dm.target_vel_snapshot[axis];
+            int32_t cmd = dm.commanded_vel_snapshot[axis];
+            int32_t cur = dm.current_vel_snapshot[axis];
+
+            if(dm.mode_snapshot[axis] == (uint8_t)AxisMode_Velocity || t != 0 || cmd != 0 || cur != 0)
+                dm_report_velocity(axis, t, cmd, cur);
         }
     }
 
@@ -1145,8 +1180,9 @@ void direct_motion_init (void)
 
     dm.active_snapshot = false;
 
-    if(hal.get_elapsed_ticks)
-        dm.last_velocity_heartbeat_ms = dm.last_ctrl_ms = hal.get_elapsed_ticks();
+    dm.last_velocity_heartbeat_ms = 0;
+    dm.ctrl_time_ms = 0;
+    dm.ctrl_subtick = 0;
 
     if(!dm_hooks_installed) {
         dm_hooks_installed = true;
