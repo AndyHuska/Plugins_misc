@@ -834,10 +834,16 @@ static void dm_generate_steps (void)
 static void dm_interrupt_callback (void)
 {
     if(!dm.active) {
-        // Only delegate to core ISR when the core is actually stepping.
-        // Calling stepper_driver_interrupt_handler() while idle can hit the
-        // segment-empty path where st.exec_block is NULL and hardfault.
-        if(st_is_stepping())
+        // Delegate to core ISR whenever core motion states are active.
+        // st_is_stepping() is too strict here because normal gcode motion
+        // startup can have stepping=true while st.exec_block is still NULL
+        // until the first ISR service call prepares a segment.
+        sys_state_t state = state_get();
+        // IMPORTANT: Do not delegate on STATE_JOG alone. Direct-motion can
+        // transiently leave state in JOG while no core step segment exists,
+        // and calling stepper_driver_interrupt_handler() in that window can
+        // hit the segment-empty path and hardfault.
+        if(st_is_stepping() || state == STATE_CYCLE || state == STATE_HOMING || state == STATE_HOLD)
             stepper_driver_interrupt_handler();
         return;
     }
@@ -870,6 +876,30 @@ static void dm_interrupt_callback (void)
     if(dm.active)
         dm_generate_steps();
 }
+
+#if REPORT_REALTIME_AXIS_VELOCITY
+bool direct_motion_get_realtime_axis_rates (float *rates)
+{
+    if(rates == NULL)
+        return false;
+
+    for(uint8_t axis = 0; axis < N_AXIS; axis++)
+        rates[axis] = 0.0f;
+
+    if(!dm.active_snapshot)
+        return false;
+
+    for(uint8_t axis = 0; axis < DM_AXES && axis < N_AXIS; axis++) {
+        int32_t spm_q16 = steps_per_mm_q16[axis];
+        int32_t v_steps_s_q16 = dm.current_vel_snapshot[axis];
+
+        if(spm_q16 != 0 && v_steps_s_q16 != 0)
+            rates[axis] = ((float)v_steps_s_q16 * 60.0f) / (float)spm_q16;
+    }
+
+    return true;
+}
+#endif
 
 static void dm_apply_velocity_xyz_legacy (const dm_vel_xyz_t *vec)
 {
