@@ -220,7 +220,7 @@ static status_code_t mcode_validate (parser_block_t *gc_block)
         if(gc_block->words.q != gc_block->words.r)
             return Status_GcodeValueWordMissing;
 
-        if(gc_block->words.q && (gc_block->values.q < 10.0f || gc_block->values.q > 1000000.0f))
+        if(gc_block->words.q && (gc_block->values.q < 1.0f || gc_block->values.q > 1000000.0f))
             return Status_GcodeValueOutOfRange;
 
         if(gc_block->words.r && (gc_block->values.r < 0.0f || gc_block->values.r > gc_block->values.q))

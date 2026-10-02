@@ -936,8 +936,8 @@ static void dm_handle_frame (uint8_t type, uint16_t sequence, const uint8_t *pay
 
     if(!seq_is_newer(sequence, dm.last_sequence))
     {
-        dm_report_error(sequence, type, DM_Err_StaleSequence, plen);
-        return;
+        //dm_report_error(sequence, type, DM_Err_StaleSequence, plen);
+        //return;
     }
 
     dm.last_sequence = sequence;
