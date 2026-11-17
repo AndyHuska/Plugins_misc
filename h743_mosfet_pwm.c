@@ -8,7 +8,7 @@
 
 #include "driver.h"
 
-#if H743_MOSFET_PWM_ENABLE == 1 && defined(BOARD_WAVESHARE_OPENH743I)
+#if H743_MOSFET_PWM_ENABLE == 1 && (defined(BOARD_WAVESHARE_OPENH743I) || defined(BOARD_PMC_02_AA))
 
 #include <stdio.h>
 #include <string.h>
@@ -17,7 +17,13 @@
 #include "grbl/protocol.h"
 #include "grbl/gcode.h"
 
+#if defined(BOARD_PMC_02_AA)
 #define MOSPWM_CHANNELS 8
+#define MOSPWM_PLUGIN_NAME "PMC-02-AA 8ch relay PWM"
+#else
+#define MOSPWM_CHANNELS 8
+#define MOSPWM_PLUGIN_NAME "H743 8ch MOSFET PWM"
+#endif
 #define MOSPWM_MCODE_SET_DUTY 1010
 #define MOSPWM_MCODE_SET_FREQ 1011
 #define MOSPWM_MCODE_REPORT   1012
@@ -52,10 +58,12 @@ static const mosfet_gpio_t mosfet_gpio[MOSPWM_CHANNELS] = {
     { PWMOUTPUT1_PORT, PWMOUTPUT1_PIN },
     { PWMOUTPUT2_PORT, PWMOUTPUT2_PIN },
     { PWMOUTPUT3_PORT, PWMOUTPUT3_PIN },
+#if MOSPWM_CHANNELS > 4
     { PWMOUTPUT4_PORT, PWMOUTPUT4_PIN },
     { PWMOUTPUT5_PORT, PWMOUTPUT5_PIN },
     { PWMOUTPUT6_PORT, PWMOUTPUT6_PIN },
     { PWMOUTPUT7_PORT, PWMOUTPUT7_PIN }
+#endif
 };
 
 static int8_t find_output_port (GPIO_TypeDef *port, uint8_t pin)
@@ -290,7 +298,7 @@ static void onReportOptions (bool newopt)
         on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("H743 8ch MOSFET PWM", "0.04");
+        report_plugin(MOSPWM_PLUGIN_NAME, "0.04");
 }
 
 static bool ensure_channel (uint8_t ch)
