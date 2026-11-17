@@ -3,6 +3,7 @@
 #if VELOCITY_JOG_ENABLE
 
 #include <string.h>
+#include <stdio.h>
 
 #include "grbl/hal.h"
 #include "grbl/system.h"
@@ -15,6 +16,13 @@
 #include "grbl/gcode.h"
 
 #include "direct_motion.h"
+#if VELOCITY_AXES_ENABLE
+#include "velocity_axes.h"
+#endif
+
+/* Setup/manual motion: independent axis moves may overlap jogging or zeroing
+    other axes (for example, conveyor indexing while X/Y are adjusted). DM is
+    not coordinated process motion and must not replace the G-code/G64 planner. */
 
 #define DM_FRAME_SYNC0 0xA5u
 #define DM_FRAME_SYNC1 0x5Au
@@ -33,7 +41,14 @@
 #define DM_FIXED_SHIFT 16
 #define DM_FIXED_ONE   (1 << DM_FIXED_SHIFT)
 
-#define DM_AXES 3u
+// Velocity and acceleration are Q8: int32 then spans far beyond the DM_ISR_HZ step rate ceiling.
+#define DM_VEL_SHIFT 8
+#define DM_VEL_ONE   (1 << DM_VEL_SHIFT)
+#define DM_VMAX_STEPS_S_Q8 ((int32_t)DM_ISR_HZ << DM_VEL_SHIFT)
+#define DM_AMAX_STEPS_S2_Q8 INT32_MAX
+
+#define DM_AXES N_AXIS
+#define DM_XYZ_AXES 3u
 
 // 1 kHz control loop.
 #define DM_CTRL_HZ 1000u
@@ -107,7 +122,7 @@ typedef struct {
 } dm_stop_axis_t;
 
 typedef struct {
-    int32_t mm_s_q16[DM_AXES];
+    int32_t mm_s_q16[DM_XYZ_AXES];
 } dm_vel_xyz_t;
 
 #define DM_LEN_SET_VELOCITY_XYZ     12u
@@ -120,11 +135,11 @@ typedef struct {
     axis_mode_t mode;
     axis_phase_t phase;
     int64_t target_pos_steps_q16;
-    int32_t target_vel_steps_s_q16;     // velocity mode target.
-    int32_t commanded_vel_steps_s_q16;  // trajectory command.
-    int32_t current_vel_steps_s_q16;    // ramped actual.
-    int32_t vmax_steps_s_q16;
-    int32_t acc_steps_s2_q16;
+    int32_t target_vel_steps_s_q8;      // velocity mode target.
+    int32_t commanded_vel_steps_s_q8;   // trajectory command.
+    int32_t current_vel_steps_s_q8;     // ramped actual.
+    int32_t vmax_steps_s_q8;
+    int32_t acc_steps_s2_q8;
     int64_t phase_accum_num;
     bool target_valid;
 } dm_axis_t;
@@ -150,16 +165,49 @@ static dm_rx_t rx = {0};
 static dm_state_t dm = {0};
 
 static int32_t steps_per_mm_q16[DM_AXES] = {0};
-static int32_t default_vmax_steps_s_q16[DM_AXES] = {0};
-static int32_t default_acc_steps_s2_q16[DM_AXES] = {0};
-static int32_t default_acc_step_q16[DM_AXES] = {0};
+static int32_t default_vmax_steps_s_q8[DM_AXES] = {0};
+static int32_t default_acc_steps_s2_q8[DM_AXES] = {0};
 
 static stepper_interrupt_callback_ptr stepper_irq_org = NULL;
 static on_unknown_realtime_cmd_ptr on_unknown_realtime_org = NULL;
 static on_execute_realtime_ptr on_execute_realtime_org = NULL;
 static bool dm_hooks_installed = false;
+static on_report_options_ptr on_report_options_org;
+static direct_motion_remote_t remote_backend;
+static volatile uint8_t remote_active_mask, remote_stop_mask;
+static volatile bool remote_immediate_stop;
+static float remote_rates[DM_AXES];
 
-static int32_t accel_step_per_tick_q16 (int32_t acc_steps_s2_q16);
+static bool axis_remote(uint8_t axis)
+{
+    return axis < DM_AXES && (remote_backend.axes_mask & (1u << axis));
+}
+
+static bool axis_reserved(uint8_t axis)
+{
+#if VELOCITY_AXES_ENABLE
+    return axis < DM_AXES && (velocity_axes_reserved().mask & (1u << axis));
+#else
+    (void)axis;
+    return false;
+#endif
+}
+
+uint8_t direct_motion_remote_axes(void)
+{
+    return remote_backend.axes_mask;
+}
+
+bool direct_motion_bind_remote(const direct_motion_remote_t *backend)
+{
+    if(!backend || dm.active || remote_backend.axes_mask || !backend->move || !backend->velocity ||
+       !backend->stop || !backend->state || (backend->axes_mask & ~AXES_BITMASK))
+        return false;
+    remote_backend = *backend;
+    return true;
+}
+
+static int32_t accel_step_per_tick_q8 (int32_t acc_steps_s2_q8);
 
 static int32_t q16_steps_round_to_int (int64_t steps_q16)
 {
@@ -199,7 +247,8 @@ typedef enum {
     DM_Err_UnknownType = 2,
     DM_Err_BadLength = 3,
     DM_Err_CommandRejected = 4,
-    DM_Err_BadCrc = 5
+    DM_Err_BadCrc = 5,
+    DM_Err_AxisReserved = 6
 } dm_error_t;
 
 static inline int32_t iabs32 (int32_t v)
@@ -240,9 +289,15 @@ static bool dm_refresh_axis_scalars (uint8_t axis)
         acc_mm_s2 = DM_DEFAULT_ACC_MM_S2;
 
     steps_per_mm_q16[axis] = (int32_t)(spm * (float)DM_FIXED_ONE);
-    default_vmax_steps_s_q16[axis] = (int32_t)((max_mm_s * spm) * (float)DM_FIXED_ONE);
-    default_acc_steps_s2_q16[axis] = (int32_t)((acc_mm_s2 * spm) * (float)DM_FIXED_ONE);
-    default_acc_step_q16[axis] = accel_step_per_tick_q16(default_acc_steps_s2_q16[axis]);
+
+    float vmax = max_mm_s * spm, amax = acc_mm_s2 * spm;
+    if(vmax > (float)DM_ISR_HZ)
+        vmax = (float)DM_ISR_HZ;
+    if(amax > (float)(DM_AMAX_STEPS_S2_Q8 >> DM_VEL_SHIFT))
+        amax = (float)(DM_AMAX_STEPS_S2_Q8 >> DM_VEL_SHIFT);
+
+    default_vmax_steps_s_q8[axis] = (int32_t)(vmax * (float)DM_VEL_ONE);
+    default_acc_steps_s2_q8[axis] = (int32_t)(amax * (float)DM_VEL_ONE);
 
     return steps_per_mm_q16[axis] > 0;
 }
@@ -302,6 +357,11 @@ static void dm_report_error (uint16_t sequence, uint8_t type, dm_error_t err, ui
     strcat(msg, "]" ASCII_EOL);
 
     hal.stream.write(msg);
+}
+
+void direct_motion_report_remote_error(uint16_t sequence, uint8_t type, uint8_t axis)
+{
+    dm_report_error(sequence, type, DM_Err_CommandRejected, axis);
 }
 
 static void dm_report_ok (uint16_t sequence, uint8_t type)
@@ -401,18 +461,18 @@ static void dm_report_rx_move_abs (const dm_move_abs_t *cmd)
     hal.stream.write(msg);
 }
 
-static void dm_report_velocity (uint8_t axis, int32_t target_steps_s_q16, int32_t commanded_steps_s_q16, int32_t current_steps_s_q16)
+static void dm_report_velocity (uint8_t axis, int32_t target_steps_s_q8, int32_t commanded_steps_s_q8, int32_t current_steps_s_q8)
 {
     char msg[120];
 
     strcpy(msg, "[DM:VEL,");
     strcat(msg, uitoa((uint32_t)axis));
     strcat(msg, ",t=");
-    dm_append_i32(msg, target_steps_s_q16);
+    dm_append_i32(msg, target_steps_s_q8);
     strcat(msg, ",cmd=");
-    dm_append_i32(msg, commanded_steps_s_q16);
+    dm_append_i32(msg, commanded_steps_s_q8);
     strcat(msg, ",c=");
-    dm_append_i32(msg, current_steps_s_q16);
+    dm_append_i32(msg, current_steps_s_q8);
     strcat(msg, "]" ASCII_EOL);
 
     hal.stream.write(msg);
@@ -446,17 +506,21 @@ static void dm_set_state_jog_if_needed (void)
 
 static void dm_axis_set_defaults (uint8_t axis)
 {
-    dm.axis[axis].vmax_steps_s_q16 = default_vmax_steps_s_q16[axis];
-    dm.axis[axis].acc_steps_s2_q16 = default_acc_steps_s2_q16[axis];
+    dm.axis[axis].vmax_steps_s_q8 = default_vmax_steps_s_q8[axis];
+    dm.axis[axis].acc_steps_s2_q8 = default_acc_steps_s2_q8[axis];
 }
 
 static void dm_axis_stop (uint8_t axis)
 {
     if(!axis_valid(axis))
         return;
+    if(axis_remote(axis)) {
+        remote_stop_mask |= axis_bit(axis);
+        return;
+    }
 
-    dm.axis[axis].target_vel_steps_s_q16 = 0;
-    dm.axis[axis].commanded_vel_steps_s_q16 = 0;
+    dm.axis[axis].target_vel_steps_s_q8 = 0;
+    dm.axis[axis].commanded_vel_steps_s_q8 = 0;
     dm.axis[axis].target_valid = false;
 
     if(dm.axis[axis].mode == AxisMode_Position)
@@ -474,6 +538,8 @@ static void dm_stop_all (void)
 
 static void dm_stop_immediate (void)
 {
+    remote_stop_mask |= remote_backend.axes_mask;
+    remote_immediate_stop = true;
     dm.active = false;
     dm.needs_idle_sync = false;
     dm.isr_rate_forced = false;
@@ -481,9 +547,9 @@ static void dm_stop_immediate (void)
         dm.axis[axis].mode = AxisMode_Inactive;
         dm.axis[axis].phase = AxisPhase_Inactive;
         dm.axis[axis].target_valid = false;
-        dm.axis[axis].target_vel_steps_s_q16 = 0;
-        dm.axis[axis].commanded_vel_steps_s_q16 = 0;
-        dm.axis[axis].current_vel_steps_s_q16 = 0;
+        dm.axis[axis].target_vel_steps_s_q8 = 0;
+        dm.axis[axis].commanded_vel_steps_s_q8 = 0;
+        dm.axis[axis].current_vel_steps_s_q8 = 0;
         dm.axis[axis].phase_accum_num = 0;
     }
 }
@@ -505,27 +571,43 @@ static int64_t mm_q16_to_steps_q16 (uint8_t axis, int32_t mm_q16)
     return ((int64_t)mm_q16 * (int64_t)steps_per_mm_q16[axis]) >> DM_FIXED_SHIFT;
 }
 
-static int32_t mm_s_q16_to_steps_s_q16 (uint8_t axis, int32_t mm_s_q16)
+static int32_t clamp_q8 (int64_t v, int32_t max_v)
+{
+    return (int32_t)(v > max_v ? max_v : (v < -max_v ? -max_v : v));
+}
+
+// Wire values are Q16 mm/s (mm/s^2); steps_per_mm is Q16; result is Q8 steps/s (steps/s^2).
+static int32_t mm_s_q16_to_steps_s_q8 (uint8_t axis, int32_t mm_s_q16)
 {
     if(steps_per_mm_q16[axis] == 0)
         return 0;
-    return (int32_t)(((int64_t)mm_s_q16 * (int64_t)steps_per_mm_q16[axis]) >> DM_FIXED_SHIFT);
+    return clamp_q8(((int64_t)mm_s_q16 * (int64_t)steps_per_mm_q16[axis]) >> (2 * DM_FIXED_SHIFT - DM_VEL_SHIFT), DM_VMAX_STEPS_S_Q8);
 }
 
-static int32_t mm_s2_q16_to_steps_s2_q16 (uint8_t axis, int32_t mm_s2_q16)
+static int32_t mm_s2_q16_to_steps_s2_q8 (uint8_t axis, int32_t mm_s2_q16)
 {
     if(steps_per_mm_q16[axis] == 0)
         return 0;
-    return (int32_t)(((int64_t)mm_s2_q16 * (int64_t)steps_per_mm_q16[axis]) >> DM_FIXED_SHIFT);
+    return clamp_q8(((int64_t)mm_s2_q16 * (int64_t)steps_per_mm_q16[axis]) >> (2 * DM_FIXED_SHIFT - DM_VEL_SHIFT), DM_AMAX_STEPS_S2_Q8);
 }
 
-static int32_t accel_step_per_tick_q16 (int32_t acc_steps_s2_q16)
+static int32_t accel_step_per_tick_q8 (int32_t acc_steps_s2_q8)
 {
-    return acc_steps_s2_q16 / (int32_t)DM_CTRL_HZ;
+    int32_t dv = acc_steps_s2_q8 / (int32_t)DM_CTRL_HZ;
+
+    return dv == 0 && acc_steps_s2_q8 > 0 ? 1 : dv;
 }
 
 static void dm_set_velocity_axis (uint8_t axis, int32_t mm_s_q16)
 {
+    if(axis_remote(axis)) {
+        if(remote_backend.velocity(axis, mm_s_q16, dm.last_sequence)) {
+            remote_active_mask |= axis_bit(axis);
+            dm.axis[axis].mode = AxisMode_Velocity;
+            dm.axis[axis].target_vel_steps_s_q8 = mm_s_q16;
+        }
+        return;
+    }
     dm_axis_t *a = &dm.axis[axis];
 
     if(!dm_refresh_axis_scalars(axis))
@@ -535,11 +617,11 @@ static void dm_set_velocity_axis (uint8_t axis, int32_t mm_s_q16)
 
     // For direct jog velocity mode, follow host-requested speed directly.
     // Positional move limits remain enforced in move planning paths.
-    int32_t new_target = mm_s_q16_to_steps_s_q16(axis, mm_s_q16);
+    int32_t new_target = mm_s_q16_to_steps_s_q8(axis, mm_s_q16);
 
     // Host key-repeat may resend the same jog vector frequently.
     // Ignore redundant target updates to avoid unnecessary phase churn and log load.
-    if(a->mode == AxisMode_Velocity && a->target_vel_steps_s_q16 == new_target)
+    if(a->mode == AxisMode_Velocity && a->target_vel_steps_s_q8 == new_target)
         return;
 
     if(a->mode != AxisMode_Velocity) {
@@ -547,19 +629,28 @@ static void dm_set_velocity_axis (uint8_t axis, int32_t mm_s_q16)
         a->target_valid = false;
         a->phase = AxisPhase_Accelerating;
         dm_report_axis_phase(axis, (uint8_t)a->mode, (uint8_t)a->phase);
-    } else if(new_target == 0 && a->target_vel_steps_s_q16 != 0) {
+    } else if(new_target == 0 && a->target_vel_steps_s_q8 != 0) {
         a->phase = AxisPhase_Decelerating;
         dm_report_axis_phase(axis, (uint8_t)a->mode, (uint8_t)a->phase);
     }
 
     // If already jogging, treat repeated messages as target updates only.
-    a->target_vel_steps_s_q16 = new_target;
+    a->target_vel_steps_s_q8 = new_target;
 }
 
 static bool dm_move_absolute_axis (uint8_t axis, int32_t target_mm_q16, int32_t vmax_mm_s_q16, int32_t acc_mm_s2_q16)
 {
     if(!axis_valid(axis) || (!dm_can_start() && !dm.active))
         return false;
+
+    if(axis_remote(axis)) {
+        if(!remote_backend.move(axis, false, target_mm_q16, vmax_mm_s_q16, acc_mm_s2_q16, dm.last_sequence))
+            return false;
+        remote_active_mask |= axis_bit(axis);
+        dm.axis[axis].mode = AxisMode_Position;
+        dm_set_state_jog_if_needed();
+        return true;
+    }
 
     if(!dm_refresh_axis_scalars(axis))
         return false;
@@ -573,15 +664,18 @@ static bool dm_move_absolute_axis (uint8_t axis, int32_t target_mm_q16, int32_t 
     if(!dm_check_target_in_limits(axis, target_steps_q16))
         return false;
 
-    int32_t vmax = vmax_mm_s_q16 <= 0 ? default_vmax_steps_s_q16[axis] : mm_s_q16_to_steps_s_q16(axis, vmax_mm_s_q16);
-    int32_t acc = acc_mm_s2_q16 <= 0 ? default_acc_steps_s2_q16[axis] : mm_s2_q16_to_steps_s2_q16(axis, acc_mm_s2_q16);
+    int32_t vmax = vmax_mm_s_q16 <= 0 ? default_vmax_steps_s_q8[axis] : mm_s_q16_to_steps_s_q8(axis, vmax_mm_s_q16);
+    int32_t acc = acc_mm_s2_q16 <= 0 ? default_acc_steps_s2_q8[axis] : mm_s2_q16_to_steps_s2_q8(axis, acc_mm_s2_q16);
 
+    uint32_t irq = __get_PRIMASK();
+    __disable_irq();
     a->mode = AxisMode_Position;
     a->target_pos_steps_q16 = target_steps_q16;
     a->target_valid = true;
-    a->vmax_steps_s_q16 = iabs32(vmax);
-    a->acc_steps_s2_q16 = iabs32(acc);
+    a->vmax_steps_s_q8 = iabs32(vmax);
+    a->acc_steps_s2_q8 = iabs32(acc);
     a->phase = AxisPhase_Accelerating;
+    __set_PRIMASK(irq);
 
     dm_report_move(axis, sys.position[axis], target_steps_i);
 
@@ -595,6 +689,16 @@ static bool dm_move_relative_axis (uint8_t axis, int32_t delta_mm_q16, int32_t v
     if(!axis_valid(axis))
         return false;
 
+    if(axis_remote(axis)) {
+        if((!dm_can_start() && !dm.active) ||
+           !remote_backend.move(axis, true, delta_mm_q16, vmax_mm_s_q16, acc_mm_s2_q16, dm.last_sequence))
+            return false;
+        remote_active_mask |= axis_bit(axis);
+        dm.axis[axis].mode = AxisMode_Position;
+        dm_set_state_jog_if_needed();
+        return true;
+    }
+
     if(!dm_refresh_axis_scalars(axis))
         return false;
 
@@ -607,6 +711,8 @@ static bool dm_move_relative_axis (uint8_t axis, int32_t delta_mm_q16, int32_t v
 
 static void dm_update_axis_profile (uint8_t axis)
 {
+    if(axis_remote(axis))
+        return;
     dm_axis_t *a = &dm.axis[axis];
 
     if(a->mode == AxisMode_Inactive) {
@@ -615,13 +721,13 @@ static void dm_update_axis_profile (uint8_t axis)
     }
 
     if(a->mode == AxisMode_Velocity) {
-        a->commanded_vel_steps_s_q16 = a->target_vel_steps_s_q16;
-        if(a->current_vel_steps_s_q16 < a->commanded_vel_steps_s_q16)
+        a->commanded_vel_steps_s_q8 = a->target_vel_steps_s_q8;
+        if(a->current_vel_steps_s_q8 < a->commanded_vel_steps_s_q8)
             a->phase = AxisPhase_Accelerating;
-        else if(a->current_vel_steps_s_q16 > a->commanded_vel_steps_s_q16)
+        else if(a->current_vel_steps_s_q8 > a->commanded_vel_steps_s_q8)
             a->phase = AxisPhase_Decelerating;
         else {
-            if(a->current_vel_steps_s_q16 == 0) {
+            if(a->current_vel_steps_s_q8 == 0) {
                 a->phase = AxisPhase_TargetReached;
                 a->mode = AxisMode_Inactive;
             } else
@@ -636,16 +742,16 @@ static void dm_update_axis_profile (uint8_t axis)
     int32_t cur_steps = sys.position[axis];
     int32_t target_steps = (int32_t)(a->target_pos_steps_q16 >> DM_FIXED_SHIFT);
     int32_t step_err = target_steps - cur_steps;
-    int32_t v = a->current_vel_steps_s_q16;
+    int32_t v = a->current_vel_steps_s_q8;
     int32_t abs_v = iabs32(v);
-    int32_t acc = a->acc_steps_s2_q16 > 0 ? a->acc_steps_s2_q16 : default_acc_steps_s2_q16[axis];
-    int32_t acc_step = accel_step_per_tick_q16(acc);
+    int32_t acc = a->acc_steps_s2_q8 > 0 ? a->acc_steps_s2_q8 : default_acc_steps_s2_q8[axis];
+    int32_t acc_step = accel_step_per_tick_q8(acc);
 
     // Deterministic completion: stop only when exactly on target step and
     // velocity has been reduced sufficiently.
     if(step_err == 0 && abs_v <= acc_step) {
-        a->commanded_vel_steps_s_q16 = 0;
-        a->current_vel_steps_s_q16 = 0;
+        a->commanded_vel_steps_s_q8 = 0;
+        a->current_vel_steps_s_q8 = 0;
         a->mode = AxisMode_Inactive;
         a->phase = AxisPhase_TargetReached;
         a->target_valid = false;
@@ -654,17 +760,20 @@ static void dm_update_axis_profile (uint8_t axis)
 
     // If exactly on target but still moving, command a clean decel to zero.
     if(step_err == 0) {
-        a->commanded_vel_steps_s_q16 = 0;
+        a->commanded_vel_steps_s_q8 = 0;
         a->phase = AxisPhase_Decelerating;
         return;
     }
 
     int32_t dir = dist_q16 >= 0 ? 1 : -1;
-    uint64_t stop_dist_q16 = (uint64_t)(((int64_t)abs_v * (int64_t)abs_v) / (2 * (int64_t)acc));
+    // v^2 / 2a is Q8 steps; shift to Q16 to compare with the position-domain distance.
+    uint64_t stop_dist_q16 = (uint64_t)(((int64_t)abs_v * (int64_t)abs_v) / (2 * (int64_t)acc)) << (DM_FIXED_SHIFT - DM_VEL_SHIFT);
 
-    uint64_t vlim_sq = 2ULL * (uint64_t)acc * abs_dist_q16;
-    int32_t vlim_dist = (int32_t)isqrt_u64(vlim_sq);
-    int32_t desired_abs = vlim_dist < a->vmax_steps_s_q16 ? vlim_dist : a->vmax_steps_s_q16;
+    uint64_t abs_dist_q8 = abs_dist_q16 >> (DM_FIXED_SHIFT - DM_VEL_SHIFT);
+    uint64_t vlim_dist = abs_dist_q8 > UINT64_MAX / (2ULL * (uint64_t)acc)
+                          ? UINT64_MAX
+                          : isqrt_u64(2ULL * (uint64_t)acc * abs_dist_q8);
+    int32_t desired_abs = vlim_dist < (uint64_t)a->vmax_steps_s_q8 ? (int32_t)vlim_dist : a->vmax_steps_s_q8;
 
     if(abs_dist_q16 <= stop_dist_q16)
         a->phase = AxisPhase_Decelerating;
@@ -673,22 +782,22 @@ static void dm_update_axis_profile (uint8_t axis)
     else
         a->phase = AxisPhase_Cruising;
 
-    a->commanded_vel_steps_s_q16 = dir * desired_abs;
+    a->commanded_vel_steps_s_q8 = dir * desired_abs;
 }
 
 static void dm_update_ramps_1khz (void)
 {
-    bool any_active = false;
+    bool any_active = remote_active_mask != 0;
 
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
         dm_axis_t *a = &dm.axis[axis];
 
         dm_update_axis_profile(axis);
 
-        int32_t acc = a->acc_steps_s2_q16 > 0 ? a->acc_steps_s2_q16 : default_acc_steps_s2_q16[axis];
-        int32_t dv = accel_step_per_tick_q16(acc);
-        int32_t cur = a->current_vel_steps_s_q16;
-        int32_t cmd = a->commanded_vel_steps_s_q16;
+        int32_t acc = a->acc_steps_s2_q8 > 0 ? a->acc_steps_s2_q8 : default_acc_steps_s2_q8[axis];
+        int32_t dv = accel_step_per_tick_q8(acc);
+        int32_t cur = a->current_vel_steps_s_q8;
+        int32_t cmd = a->commanded_vel_steps_s_q8;
 
         if(cur < cmd) {
             cur += dv;
@@ -700,16 +809,16 @@ static void dm_update_ramps_1khz (void)
                 cur = cmd;
         }
 
-        a->current_vel_steps_s_q16 = cur;
+        a->current_vel_steps_s_q8 = cur;
 
         if(a->mode != AxisMode_Inactive || cur != 0)
             any_active = true;
 
         dm.mode_snapshot[axis] = (uint8_t)a->mode;
         dm.phase_snapshot[axis] = (uint8_t)a->phase;
-        dm.target_vel_snapshot[axis] = a->target_vel_steps_s_q16;
-        dm.commanded_vel_snapshot[axis] = a->commanded_vel_steps_s_q16;
-        dm.current_vel_snapshot[axis] = a->current_vel_steps_s_q16;
+        dm.target_vel_snapshot[axis] = a->target_vel_steps_s_q8;
+        dm.commanded_vel_snapshot[axis] = a->commanded_vel_steps_s_q8;
+        dm.current_vel_snapshot[axis] = a->current_vel_steps_s_q8;
     }
 
     dm.active = any_active;
@@ -723,7 +832,7 @@ static void dm_watchdog_velocity_modes (void)
 {
     bool any_nonzero_velocity_target = false;
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
-        if(dm.axis[axis].mode == AxisMode_Velocity && dm.axis[axis].target_vel_steps_s_q16 != 0) {
+        if(dm.axis[axis].mode == AxisMode_Velocity && dm.axis[axis].target_vel_steps_s_q8 != 0) {
             any_nonzero_velocity_target = true;
             break;
         }
@@ -739,7 +848,11 @@ static void dm_watchdog_velocity_modes (void)
 
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
         if(dm.axis[axis].mode == AxisMode_Velocity)
-            dm.axis[axis].target_vel_steps_s_q16 = 0;
+        {
+            if(axis_remote(axis))
+                remote_stop_mask |= axis_bit(axis);
+            dm.axis[axis].target_vel_steps_s_q8 = 0;
+        }
     }
 }
 
@@ -748,12 +861,14 @@ static void dm_generate_steps (void)
     stepper_t pulse = {0};
     axes_signals_t step = {0};
     axes_signals_t dir = {0};
-    const int64_t step_threshold = (int64_t)DM_FIXED_ONE * (int64_t)DM_ISR_HZ;
+    const int64_t step_threshold = (int64_t)DM_VEL_ONE * (int64_t)DM_ISR_HZ;
 
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
 
+        if(axis_remote(axis) || axis_reserved(axis))
+            continue;
         dm_axis_t *a = &dm.axis[axis];
-        int32_t v = a->current_vel_steps_s_q16;
+        int32_t v = a->current_vel_steps_s_q8;
 
         if(v == 0)
             continue;
@@ -774,9 +889,9 @@ static void dm_generate_steps (void)
 
                 // Hard clamp: never emit a step that crosses past the target.
                 if((!neg && next_step > target_step) || (neg && next_step < target_step)) {
-                    a->current_vel_steps_s_q16 = 0;
-                    a->commanded_vel_steps_s_q16 = 0;
-                    a->target_vel_steps_s_q16 = 0;
+                    a->current_vel_steps_s_q8 = 0;
+                    a->commanded_vel_steps_s_q8 = 0;
+                    a->target_vel_steps_s_q8 = 0;
                     a->phase_accum_num = 0;
                     a->mode = AxisMode_Inactive;
                     a->phase = AxisPhase_TargetReached;
@@ -785,35 +900,20 @@ static void dm_generate_steps (void)
                 }
             }
 
-            switch(axis) {
-                case 0:
-                    step.x = On;
-                    dir.x = neg;
-                    sys.position[X_AXIS] += neg ? -1 : 1;
-                    break;
-                case 1:
-                    step.y = On;
-                    dir.y = neg;
-                    sys.position[Y_AXIS] += neg ? -1 : 1;
-                    break;
-                case 2:
-                    step.z = On;
-                    dir.z = neg;
-                    sys.position[Z_AXIS] += neg ? -1 : 1;
-                    break;
-                default:
-                    break;
-            }
+            step.bits |= axis_bit(axis);
+            if(neg)
+                dir.bits |= axis_bit(axis);
+            sys.position[axis] += neg ? -1 : 1;
 
             if(a->mode == AxisMode_Position && a->target_valid) {
                 int32_t target_step = (int32_t)(a->target_pos_steps_q16 >> DM_FIXED_SHIFT);
-                int32_t acc = a->acc_steps_s2_q16 > 0 ? a->acc_steps_s2_q16 : default_acc_steps_s2_q16[axis];
-                int32_t acc_step = accel_step_per_tick_q16(acc);
+                int32_t acc = a->acc_steps_s2_q8 > 0 ? a->acc_steps_s2_q8 : default_acc_steps_s2_q8[axis];
+                int32_t acc_step = accel_step_per_tick_q8(acc);
 
-                if(sys.position[axis] == target_step && iabs32(a->current_vel_steps_s_q16) <= (acc_step * 2)) {
-                    a->current_vel_steps_s_q16 = 0;
-                    a->commanded_vel_steps_s_q16 = 0;
-                    a->target_vel_steps_s_q16 = 0;
+                if(sys.position[axis] == target_step && iabs32(a->current_vel_steps_s_q8) <= (acc_step * 2)) {
+                    a->current_vel_steps_s_q8 = 0;
+                    a->commanded_vel_steps_s_q8 = 0;
+                    a->target_vel_steps_s_q8 = 0;
                     a->phase_accum_num = 0;
                     a->mode = AxisMode_Inactive;
                     a->phase = AxisPhase_TargetReached;
@@ -890,11 +990,15 @@ bool direct_motion_get_realtime_axis_rates (float *rates)
         return false;
 
     for(uint8_t axis = 0; axis < DM_AXES && axis < N_AXIS; axis++) {
+        if(axis_remote(axis)) {
+            rates[axis] = remote_rates[axis];
+            continue;
+        }
         int32_t spm_q16 = steps_per_mm_q16[axis];
-        int32_t v_steps_s_q16 = dm.current_vel_snapshot[axis];
+        int32_t v_steps_s_q8 = dm.current_vel_snapshot[axis];
 
-        if(spm_q16 != 0 && v_steps_s_q16 != 0)
-            rates[axis] = ((float)v_steps_s_q16 * 60.0f) / (float)spm_q16;
+        if(spm_q16 != 0 && v_steps_s_q8 != 0)
+            rates[axis] = ((float)v_steps_s_q8 / (float)DM_VEL_ONE) * 60.0f / ((float)spm_q16 / (float)DM_FIXED_ONE);
     }
 
     return true;
@@ -906,7 +1010,7 @@ static void dm_apply_velocity_xyz_legacy (const dm_vel_xyz_t *vec)
     if(!dm_can_start() && !dm.active)
         return;
 
-    for(uint8_t axis = 0; axis < DM_AXES; axis++)
+    for(uint8_t axis = 0; axis < DM_XYZ_AXES; axis++)
         dm_set_velocity_axis(axis, vec->mm_s_q16[axis]);
 
     dm.last_velocity_heartbeat_ms = dm.ctrl_time_ms;
@@ -914,13 +1018,23 @@ static void dm_apply_velocity_xyz_legacy (const dm_vel_xyz_t *vec)
     dm_set_state_jog_if_needed();
 }
 
-static void dm_apply_velocity_masked (const dm_velocity_masked_t *cmd)
+static void dm_apply_velocity_masked (const dm_velocity_masked_t *cmd, uint16_t sequence)
 {
+    uint8_t rejected = 0;
+
+    for(uint8_t axis = 0; axis < DM_AXES; axis++) {
+        if((cmd->mask & axis_bit(axis)) && axis_reserved(axis)) {
+            if(!rejected)
+                dm_report_error(sequence, DM_MSG_SET_VELOCITY_MASKED, DM_Err_AxisReserved, axis);
+            rejected |= axis_bit(axis);
+        }
+    }
+
     if(!dm_can_start() && !dm.active)
         return;
 
     for(uint8_t axis = 0; axis < DM_AXES; axis++) {
-        if(cmd->mask & axis_bit(axis))
+        if((cmd->mask & ~rejected) & axis_bit(axis))
             dm_set_velocity_axis(axis, cmd->mm_s_q16[axis]);
     }
 
@@ -959,16 +1073,16 @@ static void dm_handle_frame (uint8_t type, uint16_t sequence, const uint8_t *pay
             break;
 
         case DM_MSG_SET_VELOCITY_MASKED:
-            if(plen == DM_LEN_SET_VELOCITY_MASKED) {
-                dm_velocity_masked_t cmd = {
-                    .mask = p[0],
-                    .mm_s_q16 = {
-                        rd_i32_le(&p[1]),
-                        rd_i32_le(&p[5]),
-                        rd_i32_le(&p[9])
-                    }
-                };
-                dm_apply_velocity_masked(&cmd);
+            if(plen == DM_LEN_SET_VELOCITY_MASKED || plen == 1u + 4u * DM_AXES) {
+                direct_motion_velocity_frame_t decoded;
+                if(!direct_motion_decode_velocity(DM_AXES, p, plen, &decoded)) {
+                    dm_report_error(sequence, type, DM_Err_CommandRejected, p[0]);
+                    break;
+                }
+                dm_velocity_masked_t cmd = { .mask = decoded.mask };
+                for(uint8_t axis = 0; axis < DM_AXES; axis++)
+                    cmd.mm_s_q16[axis] = decoded.velocity_q16[axis];
+                dm_apply_velocity_masked(&cmd, sequence);
             } else
                 dm_report_error(sequence, type, DM_Err_BadLength, plen);
             break;
@@ -983,7 +1097,9 @@ static void dm_handle_frame (uint8_t type, uint16_t sequence, const uint8_t *pay
                     .acc_mm_s2_q16 = rd_i32_le(&p[9])
                 };
                 dm_report_rx_move_abs(&cmd);
-                if(dm_move_absolute_axis(cmd.axis, cmd.target_mm_q16, cmd.vmax_mm_s_q16, cmd.acc_mm_s2_q16)) {
+                if(axis_reserved(cmd.axis))
+                    dm_report_error(sequence, type, DM_Err_AxisReserved, cmd.axis);
+                else if(dm_move_absolute_axis(cmd.axis, cmd.target_mm_q16, cmd.vmax_mm_s_q16, cmd.acc_mm_s2_q16)) {
                     dm_set_state_jog_if_needed();
                     dm_report_ok(sequence, type);
                 } else
@@ -1001,7 +1117,9 @@ static void dm_handle_frame (uint8_t type, uint16_t sequence, const uint8_t *pay
                     .vmax_mm_s_q16 = rd_i32_le(&p[5]),
                     .acc_mm_s2_q16 = rd_i32_le(&p[9])
                 };
-                if(dm_move_relative_axis(cmd.axis, cmd.delta_mm_q16, cmd.vmax_mm_s_q16, cmd.acc_mm_s2_q16)) {
+                if(axis_reserved(cmd.axis))
+                    dm_report_error(sequence, type, DM_Err_AxisReserved, cmd.axis);
+                else if(dm_move_relative_axis(cmd.axis, cmd.delta_mm_q16, cmd.vmax_mm_s_q16, cmd.acc_mm_s2_q16)) {
                     dm_set_state_jog_if_needed();
                     dm_report_ok(sequence, type);
                 } else
@@ -1154,6 +1272,37 @@ static void on_execute_realtime (sys_state_t state)
     if(on_execute_realtime_org)
         on_execute_realtime_org(state);
 
+    uint32_t irq = __get_PRIMASK();
+    __disable_irq();
+    uint8_t stops = remote_stop_mask;
+    bool immediate = remote_immediate_stop;
+    remote_stop_mask = 0;
+    remote_immediate_stop = false;
+    __set_PRIMASK(irq);
+    if(stops && !remote_backend.stop(stops, immediate)) {
+        irq = __get_PRIMASK();
+        __disable_irq();
+        remote_stop_mask |= stops;
+        remote_immediate_stop |= immediate;
+        __set_PRIMASK(irq);
+    }
+    for(uint8_t axis = 0; axis < DM_AXES; axis++) {
+        if(axis_remote(axis)) {
+            direct_motion_remote_state_t snapshot = {0};
+            if(remote_backend.state(axis, &snapshot)) {
+                hal.irq_disable();
+                if(snapshot.mode)
+                    remote_active_mask |= axis_bit(axis);
+                else
+                    remote_active_mask &= ~axis_bit(axis);
+                dm.axis[axis].mode = (axis_mode_t)snapshot.mode;
+                dm.mode_snapshot[axis] = snapshot.mode;
+                remote_rates[axis] = snapshot.rate_per_minute;
+                hal.irq_enable();
+            }
+        }
+    }
+
     if(dm.active_snapshot != active_last) {
         dm_report_state(dm.active_snapshot ? "ACTIVE" : "INACTIVE");
         active_last = dm.active_snapshot;
@@ -1174,6 +1323,8 @@ static void on_execute_realtime (sys_state_t state)
         vel_last_report_ms = dm.ctrl_time_ms;
 
         for(uint8_t axis = 0; axis < DM_AXES; axis++) {
+            if(axis_remote(axis))
+                continue;
             int32_t t = dm.target_vel_snapshot[axis];
             int32_t cmd = dm.commanded_vel_snapshot[axis];
             int32_t cur = dm.current_vel_snapshot[axis];
@@ -1192,8 +1343,22 @@ static void on_execute_realtime (sys_state_t state)
     }
 }
 
+static void dm_report_options(bool newopt)
+{
+    if(on_report_options_org)
+        on_report_options_org(newopt);
+    if(!newopt) {
+        char message[64];
+        snprintf(message, sizeof(message), "[DM:CAP,N=%u,V=%u,R=%u]" ASCII_EOL,
+                 (unsigned)DM_AXES, (unsigned)(1U + 4U * DM_AXES), (unsigned)remote_backend.axes_mask);
+        hal.stream.write(message);
+    }
+}
+
 void direct_motion_init (void)
 {
+    on_report_options_org = grbl.on_report_options;
+    grbl.on_report_options = dm_report_options;
     memset(&dm, 0, sizeof(dm));
     memset(&rx, 0, sizeof(rx));
     rx.state = Rx_Sync0;
